@@ -22,7 +22,7 @@ Files mentioned below live under the `lazy_tensor_core/lazy_tensor_core/csrc` an
 1. `tensor_methods.cpp` contains the implementations of `LazyTensor` methods defined in `tensor.h`. They are expressed in terms of `ir::Value`s, which are wrappers for nodes in the captured computation graph.
 1. `ops/` directory contains definitions for the various node kinds in the computation graphs. All ops inherit from `ir::ops::Node`.
 1. `csrc/ts_backend/ts_node_lowering.cpp` contains the main conversion logic that lowers Lazy Tensor operations (IR) into TorchScript operations (IR) for a particular operator, and also shape inferences. *Only* modify this file if the auto-lowering and auto-shape-inferring logic don't work for you. If that's the case, you will get exceptions when executing the operators.
-  1. Normally, operators that not only accept operands but also extra parameters will need dedicated lowering, for example, _log_softmax. FYI, operators that work with auto-lowering are, for example, addcdiv, sqrt, and etc.
+    1. Normally, operators that not only accept operands but also extra parameters will need dedicated lowering, for example, _log_softmax. FYI, operators that work with auto-lowering are, for example, addcdiv, sqrt, and etc.
 
 ## Unit Test
 C++ unit tests for tensor operations are in the `lazy_tensor_core/test/cpp/test_aten_ltc_ts_tensor.cpp` file. This verifies the TorchScript lazy tensors back-end against PyTorch CPU implementation. Some of these tests also check if the lowering we provide is actually called, by checking counters which track how many times an operation is hit, separating the hits between the provided lowering or the fallback.
