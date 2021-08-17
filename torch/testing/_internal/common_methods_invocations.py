@@ -925,6 +925,8 @@ class ReductionOpInfo(OpInfo):
         # Override OpInfo defaults and call base class __init__
         kwargs.setdefault('inplace_variant', None)
         kwargs.setdefault('sample_inputs_func', sample_inputs_func)
+        kwargs.setdefault('default_test_dtypes', (
+            torch.uint8, torch.int64, torch.float16, torch.bfloat16, torch.float32, torch.complex64))
         super(ReductionOpInfo, self).__init__(name, **kwargs)
 
         self.identity = identity
@@ -5384,6 +5386,53 @@ def gradcheck_wrapper_triangular_input(op, input, *args, upper=False, **kwargs):
     return op(input.triu() if upper else input.tril(), upper)
 
 
+def reference_reduction_numpy(f, supports_keepdims=True):
+    """Wraps a NumPy reduction operator.
+
+    The wrapper function will forward dim and keepdim kwargs to the wrapped
+    function as the NumPy equivalent axis and keepdims kwargs.
+
+    Args:
+        f: NumPy reduction operator to wrap
+        supports_keepdims (bool, optional): Whether the NumPy operator accepts
+            keepdims parameter. If it does not, the wrapper will manually unsqueeze
+            the reduced dimensions if it was called with keepdim=True. Defaults to True.
+
+    Returns:
+        Wrapped function
+    """
+    @wraps(f)
+    def wrapper(x: np.ndarray, *args, **kwargs):
+        # Copy keys into a set
+        keys = set(kwargs.keys())
+
+        dim = kwargs.pop('dim', None)
+        keepdim = kwargs.pop('keepdim', False)
+
+        if 'dim' in keys:
+            if x.ndim == 0:
+                # NumPy reductions don't accept dim=0 for scalar inputs
+                for i in dim if isinstance(dim, tuple) else (dim,):
+                    assert i in {0, -1}
+                kwargs['axis'] = None
+            else:
+                kwargs['axis'] = tuple(dim) if isinstance(dim, Sequence) else dim
+
+        if 'keepdim' in keys and supports_keepdims:
+            kwargs['keepdims'] = keepdim
+
+        result = f(x, *args, **kwargs)
+
+        # Unsqueeze reduced dimensions if NumPy does not support keepdims
+        if keepdim and not supports_keepdims and x.ndim > 0:
+            dim = list(range(x.ndim)) if dim is None else dim
+            result = np.expand_dims(result, dim)
+
+        return result
+
+    return wrapper
+
+
 # Operator database (sorted alphabetically)
 op_db: List[OpInfo] = [
     UnaryUfuncInfo('abs',
@@ -8703,7 +8752,7 @@ op_db: List[OpInfo] = [
         'amax',
         nan_policy='propagate',
         dtypes=all_types_and(torch.float16, torch.bfloat16, torch.bool),
-        ref=lambda a, dim=None, keepdim=False, **kwargs: np.amax(a, axis=dim, keepdims=keepdim, **kwargs),
+        ref=reference_reduction_numpy(np.amax),
         skips=(
             # FIXME: sum reduces all dimensions when dim=[]
             SkipInfo('TestReductions', 'test_dim_empty'),
@@ -8714,7 +8763,7 @@ op_db: List[OpInfo] = [
         'amin',
         nan_policy='propagate',
         dtypes=all_types_and(torch.float16, torch.bfloat16, torch.bool),
-        ref=lambda a, dim=None, keepdim=False, **kwargs: np.amin(a, axis=dim, keepdims=keepdim, **kwargs),
+        ref=reference_reduction_numpy(np.amin),
         skips=(
             # FIXME: sum reduces all dimensions when dim=[]
             SkipInfo('TestReductions', 'test_dim_empty'),
@@ -8729,6 +8778,20 @@ op_db: List[OpInfo] = [
         supports_forward_ad=True,
         promotes_int_to_int64=True,
         dtypes=all_types_and_complex_and(torch.bool, torch.float16, torch.bfloat16),
+        ref=reference_reduction_numpy(np.sum),
+        decorators=(
+            # FIXME: improve precision
+            DecorateInfo(toleranceOverride({
+                torch.bfloat16: tol(atol=1e-01, rtol=1e-05),
+            }), 'TestReductions', 'test_noncontiguous_expanded'),
+            DecorateInfo(toleranceOverride({
+                torch.float16: tol(atol=1e-03, rtol=1e-02),
+                torch.complex64: tol(atol=1e-03, rtol=1e-02),
+            }), 'TestReductions', 'test_ref_small_input'),
+            DecorateInfo(toleranceOverride({
+                torch.float16: tol(atol=1e-03, rtol=1e-02),
+            }), 'TestReductions', 'test_ref_large_input'),
+        ),
         skips=(
             # FIXME: sum does not support passing keepdim without passing dim
             SkipInfo('TestReductions', 'test_dim_default_keepdim'),
@@ -8744,9 +8807,23 @@ op_db: List[OpInfo] = [
         'nansum',
         identity=0,
         nan_policy='omit',
-        promotes_int_to_int64=True,
         supports_out=False,
+        promotes_int_to_int64=True,
         dtypes=all_types_and(torch.bool, torch.float16, torch.bfloat16),
+        ref=reference_reduction_numpy(np.nansum),
+        decorators=(
+            # FIXME: improve precision
+            DecorateInfo(toleranceOverride({
+                torch.bfloat16: tol(atol=1e-01, rtol=1e-05),
+            }), 'TestReductions', 'test_noncontiguous_expanded'),
+            DecorateInfo(toleranceOverride({
+                torch.float16: tol(atol=1e-03, rtol=1e-02),
+                torch.complex64: tol(atol=1e-03, rtol=1e-02),
+            }), 'TestReductions', 'test_ref_small_input'),
+            DecorateInfo(toleranceOverride({
+                torch.float16: tol(atol=1e-03, rtol=1e-02),
+            }), 'TestReductions', 'test_ref_large_input'),
+        ),
         skips=(
             # FIXME: sum does not support passing keepdim without passing dim
             SkipInfo('TestReductions', 'test_dim_default_keepdim'),

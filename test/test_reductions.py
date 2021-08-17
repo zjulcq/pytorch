@@ -10,7 +10,7 @@ import warnings
 
 from torch._six import inf, nan
 from torch.testing import (
-    integral_types_and, floating_and_complex_types_and)
+    integral_types_and, floating_and_complex_types_and, get_all_dtypes)
 from torch.testing._internal.common_utils import (
     TestCase, run_tests, skipIfNoSciPy, slowTest, torch_to_numpy_dtype_dict,
     IS_WINDOWS, make_tensor)
@@ -84,6 +84,7 @@ def _reduced_shape(shape, dim=None, keepdim=False):
             result.append(1)
 
     return result
+
 
 class TestReductions(TestCase):
 
@@ -292,6 +293,96 @@ class TestReductions(TestCase):
             args, kwargs = next(op.generate_args_kwargs(t, dim=dim))
             result = op(t, *args, dim=dim, **kwargs)
             self.assertEqual(result.shape, _reduced_shape(t.shape, dim))
+
+    def _test_noncontiguous(self, op: ReductionOpInfo, t: torch.Tensor, **reduction_kwargs):
+        """Helper method to test noncontiguous input tensors."""
+        assert not t.is_contiguous()
+
+        t_contig = t.contiguous()
+        for args, kwargs in op.generate_args_kwargs(t_contig, **reduction_kwargs):
+            kwargs.update(reduction_kwargs)
+            result = op(t, *args, **kwargs)
+            expected = op(t_contig, *args, **kwargs)
+            self.assertEqual(result, expected)
+
+    @ops(reduction_ops)
+    def test_noncontiguous_innermost(self, device, dtype, op: ReductionOpInfo):
+        """Tests reducing along noncontiguous innermost dimension."""
+        t = make_tensor((10, 10), device, dtype)
+        self._test_noncontiguous(op, t[:, ::2], dim=1)
+
+    @ops(reduction_ops)
+    def test_noncontiguous_outermost(self, device, dtype, op: ReductionOpInfo):
+        """Tests reducing along noncontiguous outermost dimension."""
+        t = make_tensor((10, 10), device, dtype)
+        self._test_noncontiguous(op, t[::2, :], dim=0)
+
+    @ops(reduction_ops)
+    def test_noncontiguous_all(self, device, dtype, op: ReductionOpInfo):
+        """Tests reducing all dimensions of a noncontiguous tensor."""
+        t = make_tensor((10, 10), device, dtype)
+        self._test_noncontiguous(op, t[1::2, :-2:3])
+
+    @ops(reduction_ops)
+    def test_noncontiguous_transposed(self, device, dtype, op: ReductionOpInfo):
+        """Tests reducing a transposed tensor."""
+        t = make_tensor((10, 10), device, dtype)
+        self._test_noncontiguous(op, t.T)
+
+    @ops(reduction_ops)
+    def test_noncontiguous_expanded(self, device, dtype, op: ReductionOpInfo):
+        """Tests reducing a tensor with expanded singleton dimensions."""
+        t = make_tensor((10, 10), device, dtype)
+        self._test_noncontiguous(op, t.unsqueeze(1).expand(-1, 5, -1))
+
+    # NumPy does not support BFloat16 so we don't test that against reference
+    # implementations. We also don't compare dtypes or test for different
+    # keepdim because we already have other tests covering those.
+
+    def _test_ref(self, op: ReductionOpInfo, t: torch.Tensor, **reduction_kwargs):
+        """Compares op against op.ref for the given input and reduction kwargs"""
+        for args, kwargs in op.generate_args_kwargs(t, **reduction_kwargs):
+            kwargs.update(reduction_kwargs)
+            result = op(t, *args, **kwargs)
+            expected = op.ref(t.detach().cpu().numpy(), *args, **kwargs)
+            self.assertEqual(result, expected, exact_dtype=False)
+
+    @ops(filter(lambda op: op.ref is not None, reduction_ops),
+         allowed_dtypes=get_all_dtypes(include_bfloat16=False))
+    def test_ref_scalar_input(self, device, dtype, op: ReductionOpInfo):
+        """Compares op against reference for scalar input tensors"""
+        self._test_ref(op, make_tensor([], device, dtype))
+
+    @ops(filter(lambda op: op.ref is not None, reduction_ops),
+         allowed_dtypes=get_all_dtypes(include_bfloat16=False))
+    def test_ref_small_input(self, device, dtype, op: ReductionOpInfo):
+        """Compares op against reference for many small random input tensors"""
+        def make(*size):
+            return make_tensor(size, device, dtype)
+
+        self._test_ref(op, make(32))
+        self._test_ref(op, make(5, 2, 4, 3))
+        self._test_ref(op, make(5, 2, 4, 3), dim=0)
+        self._test_ref(op, make(5, 2, 4, 3), dim=-1)
+
+        if op.supports_multiple_dims:
+            self._test_ref(op, make(10, 1, 7, 4), dim=(0, -1))
+            self._test_ref(op, make(10, 1, 7, 4), dim=(0, 1, 3))
+
+    @ops(filter(lambda op: op.ref is not None, reduction_ops),
+         allowed_dtypes=get_all_dtypes(include_bfloat16=False))
+    def test_ref_large_input(self, device, dtype, op: ReductionOpInfo):
+        """Compares op against reference for a very large input to check stability"""
+        self._test_ref(op, make_tensor((2 ** 20,), device, dtype))
+
+    @ops(filter(lambda op: op.ref is not None, reduction_ops),
+         allowed_dtypes=get_all_dtypes(include_bfloat16=False))
+    def test_ref_extremal_values(self, device, dtype, op: ReductionOpInfo):
+        """Compares op against reference for input tensors with extremal values"""
+        t = make_tensor((10,), device, dtype)
+        for extremal in [nan, inf, -inf] if torch.is_floating_point(t) else [0, 1]:
+            t[5] = extremal
+            self._test_ref(op, t)
 
     ###########################################################################
     # TODO: Legacy tests - port to ReductionOpInfo
