@@ -695,7 +695,7 @@ def signature(f: NativeFunction, *, method: bool = False, pyi: bool = False) -> 
     if is_factory_function or is_like_or_new_function:
         tensor_options_args.append(PythonArgument(
             name='dtype',
-            type=BaseType(BaseTy.ScalarType),
+            type=OptionalType(BaseType(BaseTy.ScalarType)),
             default='None' if pyi else _dtype_default_type_hack(name),
             default_init='self.scalar_type()' if is_like_or_new_function else None,
         ))
@@ -707,7 +707,17 @@ def signature(f: NativeFunction, *, method: bool = False, pyi: bool = False) -> 
         ))
         tensor_options_args.append(PythonArgument(
             name='device',
-            type=BaseType(BaseTy.Device),
+            # Note: [empty_quantized handling]
+            # This should really unconditionally be an Optional type, but changing that behavior would be BC-breaking.
+            # Currently, when no device argument is specified in a factory function, the python binding layer
+            # defaults the device to the device set by `torch.set_default_tensor_type`.
+            # If instead we defaulted to c10::nullopt, then factory functions would eventually use the default device
+            # of TensorOptions, which is kCPU - effectively ignoring `torch.set_default_tensor_type`.
+            #
+            # Inserting this band-aid here to fix a problem with empty_quantized, although at some point we might want
+            # to consider breaking BC and unifying how the python binding layer and TensorOptions decide on a default.
+            # See https://github.com/pytorch/pytorch/pull/63364#issuecomment-900590178.
+            type=OptionalType(BaseType(BaseTy.Device)) if name == 'empty_quantized' else BaseType(BaseTy.Device),
             default='None',
             default_init='self.device()' if is_like_or_new_function else None,
         ))
@@ -997,7 +1007,7 @@ def cpp_dispatch_exprs(f: NativeFunction, *,
 # For certain cases it is intentionally more restrictive than necessary,
 # e.g.: it doesn't accepts doublelist with definite size.
 def arg_parser_unpack_method(t: Type, has_default: bool) -> str:
-    if has_default and str(t) not in ('ScalarType', 'Device', 'Layout?'):
+    if has_default and str(t) not in ('ScalarType?', 'Device', 'Layout?'):
         raise RuntimeError(f'type \'{t}\' does not supported unpacking with default')
 
     if isinstance(t, BaseType):
@@ -1023,7 +1033,7 @@ def arg_parser_unpack_method(t: Type, has_default: bool) -> str:
             return 'optionalTensor'
 
         elif isinstance(t.elem, BaseType):
-            if t.elem.name in [BaseTy.ScalarType, BaseTy.Scalar,
+            if t.elem.name in [BaseTy.Scalar,
                                BaseTy.int, BaseTy.bool,
                                BaseTy.float, BaseTy.str]:
                 # Regular cases: append 'Optional' to elem's unpacking method
@@ -1036,6 +1046,8 @@ def arg_parser_unpack_method(t: Type, has_default: bool) -> str:
                 return 'layoutWithDefault' if has_default else 'layoutOptional'
             elif t.elem.name == BaseTy.Device:
                 return 'deviceWithDefault' if has_default else 'deviceOptional'
+            elif t.elem.name == BaseTy.ScalarType:
+                return 'scalartypeWithDefault' if has_default else 'scalartypeOptional'
 
         elif isinstance(t.elem, ListType):
             if str(t.elem.elem) == 'int':
@@ -1093,7 +1105,7 @@ def arg_parser_output_exprs(
 
 # argument name to type for scattered tensor options fields
 TENSOR_OPTIONS_FIELDS = {
-    'dtype': 'ScalarType',
+    'dtype': 'ScalarType?',
     'device': 'Device',
     'layout': 'Layout?',
     'pin_memory': 'bool',
@@ -1155,16 +1167,19 @@ def dispatch_lambda_exprs(
     if has_toptions:
         if f.func.is_out_fn():
             raise RuntimeError(f'{f.func}: tensor options with output arg')
-        for a in ps.tensor_options_args:
-            if a.name not in TENSOR_OPTIONS_FIELDS:
+        # See Note: [empty_quantized handling]
+        # empty_quantized uses `Device?` instead of `Device`, which would cause it to fail these checks.
+        if str(f.func.name) != 'empty_quantized':
+            for a in ps.tensor_options_args:
+                if a.name not in TENSOR_OPTIONS_FIELDS:
+                    raise RuntimeError(
+                        f'{f.func}: unrecognized tensor options field \'{a.name}\' in python binding arguments')
+                if str(a.type) != TENSOR_OPTIONS_FIELDS.get(a.name):
+                    raise RuntimeError(
+                        f'{f.func}: unrecognized type \'{str(a.type)}\' for tensor options field \'{a.name}\'')
+            if not all(map(lambda a: a in tensor_options_args_names, TENSOR_OPTIONS_FIELDS.keys())):
                 raise RuntimeError(
-                    f'{f.func}: unrecognized tensor options field \'{a.name}\' in python binding arguments')
-            if str(a.type) != TENSOR_OPTIONS_FIELDS.get(a.name):
-                raise RuntimeError(
-                    f'{f.func}: unrecognized type \'{str(a.type)}\' for tensor options field \'{a.name}\'')
-        if not all(map(lambda a: a in tensor_options_args_names, TENSOR_OPTIONS_FIELDS.keys())):
-            raise RuntimeError(
-                f'{f.func}: incomplete tensor options args: {tensor_options_args_names}')
+                    f'{f.func}: incomplete tensor options args: {tensor_options_args_names}')
 
         inits.append(f'''\
 const auto options = TensorOptions()
@@ -1191,7 +1206,7 @@ torch::utils::maybe_initialize_cuda(options);
 
             inits.append(f"""\
 check_out_type_matches({arg_parser_outputs['out'].expr}, {arg_parser_outputs['dtype'].expr},
-                       {arg_parser_outputs['dtype'].is_none_expr}, {arg_parser_outputs['layout'].expr},
+                       {arg_parser_outputs['layout'].expr},
                        {arg_parser_outputs['device'].expr}, {arg_parser_outputs['device'].is_none_expr});
 """)
         # we'll set requires_grad on outgoing tensor
