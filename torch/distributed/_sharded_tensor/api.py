@@ -22,6 +22,11 @@ from torch.distributed._sharding_spec._internals import (
     validate_non_overlapping_shards_metadata
 )
 
+from ._internals import (
+    InitCommonParams,
+    create_tensor_from_params,
+)
+
 # Tracking for sharded tensor objects.
 _sharded_tensor_lock = threading.Lock()
 _sharded_tensor_current_id = 0
@@ -136,8 +141,9 @@ class ShardedTensor(object):
     ShardedTensor doesn't provide any Tensor like operations but is a wrapper
     providing the Tensor representing the local shard and the global metadata.
     Using these, users can build their custom distributed sharded computations
-    on top of this primitive. The local shards are all initialized using
-    :meth:`torch.empty`.
+    on top of this primitive. The local shards are all initialized using the
+    create_op specified by common_params.create_op, e.g., torch.ones, or
+    torch.empty
 
     Args:
         sharding_spec (:class:`torch.distributed._sharding_spec.ShardingSpec`): The specification
@@ -146,20 +152,7 @@ class ShardedTensor(object):
             tensor. Can be a variable number of arguments or a collection like a list or tuple.
 
     Keyword args:
-        dtype (:class:`torch.dtype`, optional): the desired data type of returned tensor.
-            Default: if ``None``, uses a global default (see :func:`torch.set_default_tensor_type`).
-        layout (:class:`torch.layout`, optional): the desired layout of returned Tensor.
-            Default: ``torch.strided``.
-        requires_grad (bool, optional): If autograd should record operations on the
-            returned tensor. Default: ``False``.
-        pin_memory (bool, optional): If set, returned tensor would be allocated in
-            the pinned memory. Works only for CPU tensors. Default: ``False``.
-        memory_format (:class:`torch.memory_format`, optional): the desired memory format of
-            returned Tensor. Default: ``torch.contiguous_format``.
-        process_group (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used. If specified the ShardedTensor is only
-            built on ranks that are part of this process group and the provided ``sharding_spec``
-            is applied in the context of this process group.
+        common_params (:class: `InitCommonParams`): common params to create tensor.
         init_rrefs (bool, optional): Whether or not to initialize
             :class:`torch.distributed.rpc.RRef`s pointing to remote shards.
             Need to initialize the RPC Framework if specified as ``True``.
@@ -170,11 +163,7 @@ class ShardedTensor(object):
         self,
         sharding_spec: ShardingSpec,
         *size,
-        dtype=None,
-        layout=torch.strided,
-        requires_grad=False,
-        pin_memory=False,
-        memory_format=torch.contiguous_format,
+        common_params: InitCommonParams,
         process_group=None,
         init_rrefs=False,
     ):
@@ -182,13 +171,13 @@ class ShardedTensor(object):
         # _process_group, _local_shards, etc.
         self._prepare_init(process_group=process_group, init_rrefs=init_rrefs)
 
-        if dtype is None:
-            dtype = torch.get_default_dtype()
+        if common_params.dtype is None:
+            common_params.dtype = torch.get_default_dtype()
 
-        if layout != torch.strided:
+        if common_params.layout != torch.strided:
             raise ValueError('Only torch.strided layout is currently supported')
 
-        if memory_format != torch.contiguous_format:
+        if common_params.memory_format != torch.contiguous_format:
             raise ValueError('Only torch.contiguous_format memory_format is currently supported')
 
         if len(size) == 1 and isinstance(size[0], collections.Sequence):
@@ -203,23 +192,9 @@ class ShardedTensor(object):
         self._sharding_spec = sharding_spec
 
         if isinstance(self._sharding_spec, ChunkShardingSpec):
-            self._init_chunked(
-                dims,
-                dtype,
-                layout,
-                requires_grad,
-                pin_memory,
-                memory_format,
-            )
+            self._init_chunked(dims, common_params)
         elif isinstance(self._sharding_spec, EnumerableShardingSpec):
-            self._init_enumerable(
-                dims,
-                dtype,
-                layout,
-                requires_grad,
-                pin_memory,
-                memory_format,
-            )
+            self._init_enumerable(dims, common_params)
         else:
             raise ValueError(f'Unsupported sharding_spec: {self._sharding_spec}')
 
@@ -420,15 +395,7 @@ class ShardedTensor(object):
         sharded_tensor._post_init()
         return sharded_tensor
 
-    def _init_chunked(
-        self,
-        dims,
-        dtype,
-        layout,
-        requires_grad,
-        pin_memory,
-        memory_format,
-    ):
+    def _init_chunked(self, dims, common_params: InitCommonParams, ):
         current_rank = dist.get_rank(self._process_group)
         sharding_dim = self._sharding_spec.dim  # type: ignore[attr-defined]
 
@@ -469,38 +436,22 @@ class ShardedTensor(object):
                 # Build the local shard for the current rank if it is involved in the sharding spec.
                 if current_rank == rank:
                     # Initialize the local shard.
-                    local_shard = torch.empty(
-                        *rank_dims,
-                        dtype=dtype,
-                        layout=layout,
-                        device=local_device,
-                        requires_grad=requires_grad,
-                        memory_format=memory_format,
-                        pin_memory=pin_memory,
-                    )
-
+                    local_shard = create_tensor_from_params(
+                        *rank_dims, local_device=local_device, params=common_params)
                     self._local_shards.append(Shard(local_shard, shard_metadata))
 
         # Build overall metadata
         self._metadata = ShardedTensorMetadata(
             shards_metadata,
             dims,
-            dtype,
-            layout,
-            requires_grad,
-            memory_format,
-            pin_memory,
+            common_params.dtype,
+            common_params.layout,
+            common_params.requires_grad,
+            common_params.memory_format,
+            common_params.pin_memory,
         )
 
-    def _init_enumerable(
-        self,
-        dims,
-        dtype,
-        layout,
-        requires_grad,
-        pin_memory,
-        memory_format,
-    ):
+    def _init_enumerable(self, dims, common_params: InitCommonParams):
         # Validate the sharding spec is compatible with the tensor.
         check_tensor(self._sharding_spec.shards, dims)  # type: ignore[attr-defined]
 
@@ -513,27 +464,19 @@ class ShardedTensor(object):
 
             if current_rank == rank:
                 # Initialize the local shard.
-                local_shard = torch.empty(
-                    *shard_metadata.shard_lengths,
-                    dtype=dtype,
-                    layout=layout,
-                    device=local_device,
-                    requires_grad=requires_grad,
-                    memory_format=memory_format,
-                    pin_memory=pin_memory,
-                )
-
+                local_shard = create_tensor_from_params(
+                    *shard_metadata.shard_lengths, local_device=local_device, params=common_params)
                 self._local_shards.append(Shard(local_shard, shard_metadata))
 
         # Build overall metadata
         self._metadata = ShardedTensorMetadata(
             shards_metadata,
             dims,
-            dtype,
-            layout,
-            requires_grad,
-            memory_format,
-            pin_memory,
+            common_params.dtype,
+            common_params.layout,
+            common_params.requires_grad,
+            common_params.memory_format,
+            common_params.pin_memory,
         )
 
     def _parse_and_validate_remote_device(self, remote_device: torch.distributed._remote_device):
