@@ -527,6 +527,7 @@ class OpInfo(object):
                  # the following metadata relates to sparse support and is used in test_sparse.py
                  supports_sparse=False,  # whether the op supports sparse inputs
 
+                 supports_scripting=True,  # only run tracing tests
                  # the following metadata relates to complex support and is checked in test_ops.py
                  test_conjugated_samples=True,
                  test_neg_view=True,
@@ -626,6 +627,7 @@ class OpInfo(object):
         if aliases is not None:
             self.aliases = tuple(AliasInfo(a) for a in aliases)  # type: ignore[assignment]
 
+        self.supports_scripting = supports_scripting
         self.assert_jit_shape_analysis = assert_jit_shape_analysis
 
         self.test_conjugated_samples = test_conjugated_samples
@@ -7517,6 +7519,7 @@ op_db: List[OpInfo] = [
     OpInfo('select',
            dtypes=all_types_and_complex_and(torch.bfloat16, torch.half, torch.bool),
            sample_inputs_func=sample_inputs_select,
+           assert_jit_shape_analysis=True,
            supports_forward_ad=True,
            supports_out=False),
     UnaryUfuncInfo('signbit',
@@ -8077,6 +8080,7 @@ op_db: List[OpInfo] = [
            dtypes=all_types_and_complex_and(torch.bool, torch.float16, torch.bfloat16),
            sample_inputs_func=sample_inputs_index_select,
            supports_forward_ad=True,
+           assert_jit_shape_analysis=True,
            gradcheck_nondet_tol=GRADCHECK_NONDET_TOL),
     OpInfo('index_add',
            dtypes=all_types_and_complex_and(torch.bool, torch.float16, torch.bfloat16),
@@ -8088,9 +8092,10 @@ op_db: List[OpInfo] = [
            dtypes=all_types_and_complex_and(torch.bool, torch.float16, torch.bfloat16),
            supports_out=False,
            supports_inplace_autograd=False,
+           supports_scripting=False,
            op=torch.Tensor.__getitem__,
-           sample_inputs_func=sample_inputs_getitem,
-           skips=(SkipInfo('TestJit', 'test_variant_consistency_jit'),)),
+           assert_jit_shape_analysis=False,  # TODO: support index.Tensor()
+           sample_inputs_func=sample_inputs_getitem,),
     OpInfo('index_put',
            dtypes=all_types_and_complex_and(torch.bool, torch.float16, torch.bfloat16),
            supports_out=False,
