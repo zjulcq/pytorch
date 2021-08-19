@@ -6,7 +6,7 @@
 namespace torch {
 namespace jit {
 enum class Strategy {
-  NAIVE,
+  NAIVE = 0,
   GREEDY_BY_SIZE,
   GREEDY_BY_BREADTH,
   LINEAR_SCAN,
@@ -77,6 +77,19 @@ struct region_offset_cmp {
     return reg1.offset < reg2.offset;
   }
 };
+
+struct frame_node_id_hash {
+  size_t operator()(FrameNodeId const& frame_node_id) const {
+    return std::hash<size_t>()(frame_node_id.pc) ^
+        (std::hash<std::string>()(frame_node_id.node_schema) << 1) ^
+        (std::hash<std::string>()(frame_node_id.node_header) << 2);
+  }
+};
+
+inline bool operator==(const FrameNodeId& lhs, const FrameNodeId& rhs) {
+  return lhs.pc == rhs.pc && lhs.node_schema == rhs.node_schema &&
+      lhs.node_header == rhs.node_header;
+}
 
 c10::optional<uint64_t> computeStorageSize(const Value& value);
 
